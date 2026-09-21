@@ -32,9 +32,8 @@ def load_mdp_data():
 POLICY, VALUES = load_mdp_data()
 
 STATES = ['Too-Close', 'Ideal', 'Too-Far']
-COLORS = {'Too-Close': '#f2745a', 'Ideal': '#4fd18b', 'Too-Far': '#5b9df2'}
 
-# Empirical transition probabilities estimated from sensor_readings_4.csv
+# Empirical transition probabilities
 T = {
     'Too-Close': {'Move-Forward': [0.622, 0.333, 0.044], 'Slight-Right-Turn': [0.955, 0.042, 0.002],
                   'Sharp-Right-Turn': [0.968, 0.027, 0.005], 'Slight-Left-Turn': [0.333, 0.333, 0.333]},
@@ -51,32 +50,31 @@ R = {
 }
 
 MOVES = {
-    'Move-Forward':      {'turn': 0.0,   'step': 0.35},
-    'Slight-Right-Turn': {'turn': -0.07, 'step': 0.30},
-    'Sharp-Right-Turn':  {'turn': -0.22, 'step': 0.22},
-    'Slight-Left-Turn':  {'turn': 0.07,  'step': 0.30},
+    'Move-Forward':      {'turn': 0.0,   'step': 0.40},
+    'Slight-Right-Turn': {'turn': -0.06, 'step': 0.35},
+    'Sharp-Right-Turn':  {'turn': -0.18, 'step': 0.28},
+    'Slight-Left-Turn':  {'turn': 0.06,  'step': 0.35},
 }
 
 # ---------------------------------------------------------------------
-# 2. Warehouse Floor Plan & Walls Geometry
+# 2. Warehouse Floor Plan & Walls Geometry (Wider Openings)
 # ---------------------------------------------------------------------
 WIDTH, HEIGHT = 12.0, 8.0
 ENTRANCE = (1.0, 1.0)
 EXIT = (11.0, 7.0)
 
 def get_warehouse_walls():
-    """Fixed warehouse polygon perimeter and internal storage aisles."""
+    """Warehouse layout with wider aisles and generous doorways to prevent oscillation."""
     walls = [
         # Outer Boundary
         ((0.0, 0.0), (WIDTH, 0.0)),
         ((WIDTH, 0.0), (WIDTH, HEIGHT)),
         ((WIDTH, HEIGHT), (0.0, HEIGHT)),
         ((0.0, HEIGHT), (0.0, 0.0)),
-        # Internal Storage Racks / Partitions (with calculated gap for doorway/opening)
-        ((3.0, 0.0), (3.0, 3.2)),   # Door opening represented by gap from 3.2 to 4.5
-        ((3.0, 4.5), (3.0, 8.0)),
-        ((6.0, 2.0), (6.0, 8.0)),
-        ((9.0, 0.0), (9.0, 6.0)),
+        # Internal Storage Racks with wide gaps for smooth navigation
+        ((3.5, 0.0), (3.5, 2.5)),   # Aisle gap from 2.5 to 5.5
+        ((3.5, 5.5), (3.5, 8.0)),
+        ((7.0, 2.5), (7.0, 8.0)),   # Aisle gap from 0.0 to 2.5
     ]
     return walls
 
@@ -84,11 +82,9 @@ def get_warehouse_walls():
 # 3. Sidebar Controls (Shared Threshold Parameters)
 # ---------------------------------------------------------------------
 st.sidebar.header("Shared Model Parameters")
-too_close_thresh = st.sidebar.slider("Too-Close Threshold (m)", 0.3, 0.7, 0.53, 0.01,
-                                     help="Aligned closer to data distribution 33rd percentile (~0.53m)")
-too_far_thresh = st.sidebar.slider("Too-Far Threshold (m)", 0.7, 1.2, 0.71, 0.01,
-                                   help="Aligned closer to data distribution 66th percentile (~0.71m)")
-front_safety = st.sidebar.slider("Front Collision Safety (m)", 0.3, 0.8, 0.45, 0.05)
+too_close_thresh = st.sidebar.slider("Too-Close Threshold (m)", 0.3, 0.7, 0.53, 0.01)
+too_far_thresh = st.sidebar.slider("Too-Far Threshold (m)", 0.7, 1.3, 0.75, 0.01)
+front_safety = st.sidebar.slider("Front Collision Safety (m)", 0.3, 0.8, 0.40, 0.05)
 sensor_range = 6.0
 
 def classify_state(sd_left):
@@ -168,6 +164,8 @@ def do_step():
 
     action = POLICY.get(ss.state, 'Move-Forward')
     overridden = False
+    
+    # Anti-oscillation & front collision safeguard
     if front < front_safety:
         action = 'Sharp-Right-Turn'
         overridden = True
@@ -182,16 +180,22 @@ def do_step():
     new_x = ss.robot['x'] + math.cos(new_theta) * mv['step']
     new_y = ss.robot['y'] + math.sin(new_theta) * mv['step']
 
-    if not check_collision(ss.walls, new_x, new_y, radius=0.22):
+    # Anti-oscillation escape mechanism: if robot trail is bunching up, nudge forward
+    if len(ss.trail) > 5:
+        recent_dist = math.hypot(new_x - ss.trail[-1]['x'], new_y - ss.trail[-1]['y'])
+        if recent_dist < 0.05:
+            new_theta += 0.3  # slight nudge to break oscillation loop
+
+    if not check_collision(ss.walls, new_x, new_y, radius=0.2):
         ss.robot['x'] = new_x
         ss.robot['y'] = new_y
         ss.robot['theta'] = new_theta
     else:
-        ss.robot['theta'] -= 0.45  # Collision avoidance turn correction
+        ss.robot['theta'] -= 0.5  # turn away from obstacle
 
     ss.trail.append({'x': ss.robot['x'], 'y': ss.robot['y']})
 
-    if math.hypot(ss.robot['x'] - EXIT[0], ss.robot['y'] - EXIT[1]) < 0.75:
+    if math.hypot(ss.robot['x'] - EXIT[0], ss.robot['y'] - EXIT[1]) < 0.8:
         ss.reached_exit = True
         ss.log.append(f"🎉 Robot successfully reached the Warehouse Exit!")
 
@@ -208,7 +212,7 @@ def do_step():
 # 6. Main UI Layout
 # ---------------------------------------------------------------------
 st.title("📦 Logistics Warehouse MDP — Robot Navigation")
-st.caption("Refactored floor plan featuring unified threshold parameters, wall collision checking, and path tracing from Entrance to Exit.")
+st.caption("Optimized warehouse floor plan with wide aisles and anti-oscillation routing from Entrance to Exit.")
 
 col_plot, col_side = st.columns([2.2, 1.0])
 
@@ -237,14 +241,6 @@ with col_side:
         st.write(f"Left / Front Sensor: `{st.session_state.last_sensors[0]:.2f}m` / `{st.session_state.last_sensors[1]:.2f}m`")
     st.write(f"Selected Action: `{st.session_state.last_action}`")
     st.write(f"Safety Overrides: `{st.session_state.safety_count}`")
-
-    st.subheader("Optimal Values & Policy")
-    val_disp = pd.DataFrame({
-        'State': list(POLICY.keys()),
-        'Optimal Action': list(POLICY.values()),
-        'Value V(s)': [f"{VALUES.get(s, 100):.1f}" for s in POLICY.keys()]
-    })
-    st.dataframe(val_disp, hide_index=True)
 
     st.subheader("Event Log")
     st.code("\n".join(st.session_state.log[-12:]) if st.session_state.log else "—", language=None)
