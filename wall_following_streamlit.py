@@ -1,6 +1,6 @@
 """
-Logistics Warehouse Robot — Spatial MDP Simulation (Streamlit)
-==============================================================
+Logistics Warehouse Robot — Data-Driven MDP Simulation (Streamlit)
+==================================================================
 Run with:
     pip install streamlit numpy matplotlib pandas
     streamlit run wall_following_streamlit.py
@@ -16,10 +16,19 @@ import streamlit as st
 st.set_page_config(page_title="Logistics Warehouse MDP - Robot Navigation", layout="wide")
 
 # ---------------------------------------------------------------------
-# 1. Load Optimization Results & MDP Definition
+# 1. Load Dataset & Optimization Results
 # ---------------------------------------------------------------------
 @st.cache_data
-def load_mdp_data():
+def load_data():
+    try:
+        df = pd.read_csv('sensor_readings_4.csv', header=None, names=['SD_front', 'SD_left', 'SD_right', 'SD_back', 'Class'])
+    except Exception:
+        # Fallback dummy data if file is missing
+        df = pd.DataFrame({
+            'SD_front': [1.5]*100, 'SD_left': [0.6]*100, 'SD_right': [2.0]*100, 'SD_back': [1.0]*100,
+            'Class': ['Move-Forward']*100
+        })
+    
     try:
         opt_df = pd.read_csv('optimal_value_function.csv')
         policy = dict(zip(opt_df['State'], opt_df['Optimal_Action']))
@@ -27,21 +36,10 @@ def load_mdp_data():
     except Exception:
         policy = {'Too-Close': 'Sharp-Right-Turn', 'Ideal': 'Move-Forward', 'Too-Far': 'Slight-Left-Turn'}
         values = {'Too-Close': 100.0, 'Ideal': 100.0, 'Too-Far': 100.0}
-    return policy, values
+        
+    return df, policy, values
 
-POLICY, VALUES = load_mdp_data()
-
-STATES = ['Too-Close', 'Ideal', 'Too-Far']
-
-# Empirical transition probabilities
-T = {
-    'Too-Close': {'Move-Forward': [0.622, 0.333, 0.044], 'Slight-Right-Turn': [0.955, 0.042, 0.002],
-                  'Sharp-Right-Turn': [0.968, 0.027, 0.005], 'Slight-Left-Turn': [0.333, 0.333, 0.333]},
-    'Ideal':     {'Move-Forward': [0.015, 0.976, 0.009], 'Slight-Right-Turn': [0.333, 0.333, 0.333],
-                  'Sharp-Right-Turn': [0.024, 0.961, 0.014], 'Slight-Left-Turn': [0.333, 0.333, 0.333]},
-    'Too-Far':   {'Move-Forward': [0.0, 0.5, 0.5], 'Slight-Right-Turn': [0.333, 0.333, 0.333],
-                  'Sharp-Right-Turn': [0.034, 0.188, 0.778], 'Slight-Left-Turn': [0.003, 0.055, 0.942]},
-}
+DATA, POLICY, VALUES = load_data()
 
 R = {
     'Too-Close': {'Move-Forward': -10, 'Slight-Right-Turn': 5, 'Sharp-Right-Turn': 10, 'Slight-Left-Turn': -10},
@@ -49,58 +47,23 @@ R = {
     'Too-Far':   {'Move-Forward': -2, 'Slight-Right-Turn': -10, 'Sharp-Right-Turn': -10, 'Slight-Left-Turn': 10},
 }
 
-MOVES = {
-    'Move-Forward':      {'turn': 0.0,   'step': 0.35},
-    'Slight-Right-Turn': {'turn': -0.07, 'step': 0.30},
-    'Sharp-Right-Turn':  {'turn': -0.20, 'step': 0.24},
-    'Slight-Left-Turn':  {'turn': 0.07,  'step': 0.30},
+# Action kinematic mapping for dead-reckoning reconstruction (~5 corners, ~6 laps)
+ACTION_STEPS = {
+    'Move-Forward':      {'turn': 0.0,   'step': 0.12},
+    'Slight-Right-Turn': {'turn': -0.09, 'step': 0.10},
+    'Sharp-Right-Turn':  {'turn': -0.25, 'step': 0.08},
+    'Slight-Left-Turn':  {'turn': 0.09,  'step': 0.10},
 }
 
 # ---------------------------------------------------------------------
-# 2. 5-Corner Polygon Room (~3m x 5.5m) Based on Analysis
-# ---------------------------------------------------------------------
-ENTRANCE = (1.5, 1.2)
-EXIT = (3.5, 5.0)  # Located at the left-wall opening / gap
-
-def get_polygon_walls():
-    """Defines a closed 5-corner polygon room (approx 3m x 5.5m) with a wall opening."""
-    # 5 vertices forming the perimeter
-    pts = [
-        (1.0, 1.0),   # Corner 1 (Bottom-Left)
-        (4.0, 1.0),   # Corner 2 (Bottom-Right)
-        (5.2, 3.5),   # Corner 3 (Mid-Right)
-        (4.2, 5.8),   # Corner 4 (Top-Right)
-        (1.2, 5.0)    # Corner 5 (Top-Left)
-    ]
-    
-    walls = []
-    n = len(pts)
-    for i in range(n):
-        p1 = pts[i]
-        p2 = pts[(i + 1) % n]
-        
-        # Introduce a wall gap / opening on the left wall segment (e.g., segment between Corner 5 and Corner 1)
-        if i == n - 1:
-            # Split wall to create a doorway/opening
-            mid_p = (p1[0] * 0.5 + p2[0] * 0.5, p1[1] * 0.5 + p2[1] * 0.5)
-            # Add wall before opening and wall after opening
-            walls.append((p1, (mid_p[0] - 0.3, mid_p[1] - 0.3)))
-            walls.append(((mid_p[0] + 0.3, mid_p[1] + 0.3), p2))
-        else:
-            walls.append((p1, p2))
-            
-    return walls
-
-# ---------------------------------------------------------------------
-# 3. Sidebar Controls (Shared Threshold Parameters)
+# 2. Sidebar Controls
 # ---------------------------------------------------------------------
 st.sidebar.header("Shared Model Parameters")
 too_close_thresh = st.sidebar.slider("Too-Close Threshold (m)", 0.3, 0.7, 0.53, 0.01,
                                      help="Aligned with data 33rd percentile (~0.53m)")
 too_far_thresh = st.sidebar.slider("Too-Far Threshold (m)", 0.7, 1.2, 0.71, 0.01,
                                    help="Aligned with data 66th percentile (~0.71m)")
-front_safety = st.sidebar.slider("Front Collision Safety (m)", 0.2, 0.6, 0.38, 0.05)
-sensor_range = 6.0
+max_rows = st.sidebar.slider("Simulation Dataset Rows", 500, len(DATA), 2000, 100)
 
 def classify_state(sd_left):
     if sd_left < too_close_thresh:
@@ -111,115 +74,66 @@ def classify_state(sd_left):
         return 'Ideal'
 
 # ---------------------------------------------------------------------
-# 4. Ray Casting & Collision Detection
-# ---------------------------------------------------------------------
-def ray_hit(walls, ox, oy, dx, dy):
-    best = sensor_range
-    for (ax, ay), (bx, by) in walls:
-        sx, sy = bx - ax, by - ay
-        denom = dx * sy - dy * sx
-        if abs(denom) < 1e-9:
-            continue
-        qpx, qpy = ax - ox, ay - oy
-        t = (qpx * sy - qpy * sx) / denom
-        u = (qpx * dy - qpy * dx) / denom
-        if t >= 0 and 0 <= u <= 1 and t < best:
-            best = t
-    return best
-
-def get_sensors(walls, x, y, theta):
-    dx, dy = math.cos(theta), math.sin(theta)
-    ldx, ldy = -math.sin(theta), math.cos(theta) # Left sensor (+90 deg CCW)
-    front = ray_hit(walls, x, y, dx, dy)
-    left = ray_hit(walls, x, y, ldx, ldy)
-    return front, left, (dx, dy), (ldx, ldy)
-
-def check_collision(walls, x, y, radius=0.18):
-    for (ax, ay), (bx, by) in walls:
-        px, py = bx - ax, by - ay
-        length_sq = px**2 + py**2
-        if length_sq == 0:
-            dist = math.hypot(x - ax, y - ay)
-        else:
-            t = max(0, min(1, ((x - ax) * px + (y - ay) * py) / length_sq))
-            proj_x, proj_y = ax + t * px, ay + t * py
-            dist = math.hypot(x - proj_x, y - proj_y)
-        if dist < radius:
-            return True
-    return False
-
-# ---------------------------------------------------------------------
-# 5. Session State Initialization
+# 3. Session State Initialization
 # ---------------------------------------------------------------------
 def init_simulation():
-    st.session_state.walls = get_polygon_walls()
-    st.session_state.robot = {'x': ENTRANCE[0], 'y': ENTRANCE[1], 'theta': 0.0}
-    st.session_state.state = 'Ideal'
-    st.session_state.step = 0
+    st.session_state.idx = 0
+    st.session_state.x = 3.0
+    st.session_state.y = 3.0
+    st.session_state.theta = 0.0
     st.session_state.cum_reward = 0
-    st.session_state.safety_count = 0
-    st.session_state.trail = [{'x': ENTRANCE[0], 'y': ENTRANCE[1]}]
+    st.session_state.trail = [{'x': 3.0, 'y': 3.0}]
+    st.session_state.wall_points = []
     st.session_state.log = []
     st.session_state.running = False
-    st.session_state.reached_exit = False
-    st.session_state.last_action = '—'
-    st.session_state.last_reward = None
-    st.session_state.last_sensors = (None, None)
+    st.session_state.reached_end = False
 
-if 'robot' not in st.session_state:
+if 'idx' not in st.session_state:
     init_simulation()
 
 def do_step():
     ss = st.session_state
-    if ss.reached_exit:
+    if ss.idx >= max_rows:
+        ss.reached_end = True
+        ss.running = False
         return
 
-    front, left, _, _ = get_sensors(ss.walls, ss.robot['x'], ss.robot['y'], ss.robot['theta'])
-    ss.state = classify_state(left)
+    row = DATA.iloc[ss.idx]
+    sd_front, sd_left, sd_right, sd_back = row['SD_front'], row['SD_left'], row['SD_right'], row['SD_back']
+    dataset_action = row['Class']
 
-    action = POLICY.get(ss.state, 'Move-Forward')
-    overridden = False
-    if front < front_safety:
-        action = 'Sharp-Right-Turn'
-        overridden = True
-        ss.safety_count += 1
+    state = classify_state(sd_left)
+    action = POLICY.get(state, dataset_action)
+    if action not in R[state]:
+        action = 'Move-Forward'
 
-    reward = R[ss.state][action]
+    reward = R[state][action]
     ss.cum_reward += reward
-    ss.step += 1
 
-    mv = MOVES[action]
-    new_theta = ss.robot['theta'] + mv['turn']
-    new_x = ss.robot['x'] + math.cos(new_theta) * mv['step']
-    new_y = ss.robot['y'] + math.sin(new_theta) * mv['step']
+    # Update pose using dead-reckoning kinematics based on action label
+    mv = ACTION_STEPS.get(action, {'turn': 0.0, 'step': 0.1})
+    ss.theta += mv['turn']
+    ss.x += math.cos(ss.theta) * mv['step']
+    ss.y += math.sin(ss.theta) * mv['step']
 
-    if not check_collision(ss.walls, new_x, new_y, radius=0.18):
-        ss.robot['x'] = new_x
-        ss.robot['y'] = new_y
-        ss.robot['theta'] = new_theta
-    else:
-        ss.robot['theta'] -= 0.5  # smooth turn away from wall
+    ss.trail.append({'x': ss.x, 'y': ss.y})
 
-    ss.trail.append({'x': ss.robot['x'], 'y': ss.robot['y']})
+    # Estimate wall point from left sensor reading for environment reconstruction plot
+    wall_x = ss.x + math.cos(ss.theta + math.pi/2) * sd_left
+    wall_y = ss.y + math.sin(ss.theta + math.pi/2) * sd_left
+    ss.wall_points.append({'x': wall_x, 'y': wall_y, 'opening': sd_left > 1.2})
 
-    if math.hypot(ss.robot['x'] - EXIT[0], ss.robot['y'] - EXIT[1]) < 0.6:
-        ss.reached_exit = True
-        ss.log.append(f"🎉 Robot successfully reached the Exit opening!")
-
-    ss.last_action = action + (' (safety)' if overridden else '')
-    ss.last_reward = reward
-    ss.last_sensors = (left, front)
-
-    tag = "SAFETY" if overridden else ss.state
-    ss.log.append(f"#{ss.step:03d} | State: {tag:<10s} | Action: {action:<18s} | Reward: {reward:+d}")
+    ss.log.append(f"Row #{ss.idx:04d} | State: {state:<10s} | Action: {action:<18s} | Left: {sd_left:.2f}m")
     if len(ss.log) > 100:
         ss.log.pop(0)
 
+    ss.idx += 1
+
 # ---------------------------------------------------------------------
-# 6. Main UI Layout
+# 4. Main UI Layout
 # ---------------------------------------------------------------------
-st.title("🤖 5-Corner Polygon Room — Robot Navigation MDP")
-st.caption("Refactored based on empirical data analysis: single closed loop (~3m × 5.5m) with 5 corners, clockwise wall-following, and a left-wall opening.")
+st.title("🤖 Data-Driven Warehouse Robot Navigation")
+st.caption("Reconstructing robot trajectory and mapped loop directly from `sensor_readings_4.csv` data and MDP policy evaluation.")
 
 col_plot, col_side = st.columns([2.2, 1.0])
 
@@ -229,84 +143,75 @@ with col_plot:
         st.session_state.running = not st.session_state.running
     if b2.button("Step"):
         do_step()
-    if b3.button("Reset Robot"):
+    if b3.button("Reset Simulation"):
         init_simulation()
-    speed = b4.slider("Simulation Speed (s/step)", 0.02, 0.3, 0.05, 0.02)
+    speed = b4.slider("Simulation Speed (s/step)", 0.01, 0.2, 0.03, 0.01)
     plot_ph = st.empty()
 
 with col_side:
-    st.subheader("Navigation Status")
+    st.subheader("Navigation Metrics")
     m1, m2 = st.columns(2)
-    m1.metric("Step", st.session_state.step)
+    m1.metric("Dataset Row", f"{st.session_state.idx} / {max_rows}")
     m2.metric("Total Reward", st.session_state.cum_reward)
     
-    if st.session_state.reached_exit:
-        st.success("Target Exit Reached!")
+    if st.session_state.reached_end:
+        st.success("Simulation Reached Dataset Limit!")
 
-    st.write(f"**Current State:** `{st.session_state.state}`")
-    if st.session_state.last_sensors[0] is not None:
-        st.write(f"Left / Front Sensor: `{st.session_state.last_sensors[0]:.2f}m` / `{st.session_state.last_sensors[1]:.2f}m`")
-    st.write(f"Selected Action: `{st.session_state.last_action}`")
-    st.write(f"Safety Overrides: `{st.session_state.safety_count}`")
+    current_state = classify_state(DATA.iloc[min(st.session_state.idx, len(DATA)-1)]['SD_left'])
+    st.write(f"**Current State:** `{current_state}`")
+    st.write(f"Left Sensor: `{DATA.iloc[min(st.session_state.idx, len(DATA)-1)]['SD_left']:.2f}m`")
+    st.write(f"Front Sensor: `{DATA.iloc[min(st.session_state.idx, len(DATA)-1)]['SD_front']:.2f}m`")
 
     st.subheader("Event Log")
-    st.code("\n".join(st.session_state.log[-12:]) if st.session_state.log else "—", language=None)
+    st.code("\n".join(st.session_state.log[-10:]) if st.session_state.log else "—", language=None)
 
 # ---------------------------------------------------------------------
-# 7. Render Visualization
+# 5. Render Visualization
 # ---------------------------------------------------------------------
-def render_room():
+def render_plot():
     ss = st.session_state
     fig, ax = plt.subplots(figsize=(7, 5.0))
     fig.patch.set_facecolor('#f8f9fa')
     ax.set_facecolor('#ffffff')
-    ax.set_xlim(0.0, 6.0)
-    ax.set_ylim(0.0, 6.5)
     ax.set_aspect('equal')
 
     ax.grid(True, linestyle=':', alpha=0.5, color='#cccccc')
 
-    # Draw polygon walls
-    for (ax0, ay0), (bx0, by0) in ss.walls:
-        ax.plot([ax0, bx0], [ay0, by0], color="#2b2d42", linewidth=5, solid_capstyle='round', zorder=2)
+    # Plot inferred wall points from sensor data
+    if ss.wall_points:
+        wx = [p['x'] for p in ss.wall_points if not p['opening']]
+        wy = [p['y'] for p in ss.wall_points if not p['opening']]
+        ox = [p['x'] for p in ss.wall_points if p['opening']]
+        oy = [p['y'] for p in ss.wall_points if p['opening']]
+        
+        ax.scatter(wx, wy, color="#adb5bd", s=6, alpha=0.5, label="Mapped Walls")
+        if ox:
+            ax.scatter(ox, oy, color="#e76f51", s=25, label="Wall Openings (Doorways)")
 
-    # Draw Entrance & Exit markers
-    ax.scatter([ENTRANCE[0]], [ENTRANCE[1]], color="#2a9d8f", s=160, marker='s', zorder=3, label="Entrance")
-    ax.text(ENTRANCE[0], ENTRANCE[1] - 0.35, "Entrance", color="#2a9d8f", fontweight='bold', ha='center', fontsize=9)
-
-    ax.scatter([EXIT[0]], [EXIT[1]], color="#e76f51", s=160, marker='*', zorder=3, label="Exit (Opening)")
-    ax.text(EXIT[0], EXIT[1] + 0.35, "Exit", color="#e76f51", fontweight='bold', ha='center', fontsize=9)
-
-    # Draw sensor rays
-    rx, ry = ss.robot['x'], ss.robot['y']
-    front, left, fdir, ldir = get_sensors(ss.walls, rx, ry, ss.robot['theta'])
-    ax.plot([rx, rx + ldir[0] * left], [ry, ry + ldir[1] * left], color="#adb5bd", linestyle='--', linewidth=1.2, zorder=3)
-    ax.plot([rx, rx + fdir[0] * front], [ry, ry + fdir[1] * front], color="#adb5bd", linestyle='--', linewidth=1.2, zorder=3)
-
-    # Draw Robot Path Trace
+    # Plot Robot Trail
     if len(ss.trail) > 1:
-        xs = [p['x'] for p in ss.trail]
-        ys = [p['y'] for p in ss.trail]
-        ax.plot(xs, ys, color="#3a86ff", linewidth=2.5, label="Robot Path Loop", zorder=4)
+        tx = [p['x'] for p in ss.trail]
+        ty = [p['y'] for p in ss.trail]
+        ax.plot(tx, ty, color="#3a86ff", linewidth=2.5, label="Robot Trajectory Loop", zorder=3)
 
-    # Draw Robot Position & Heading
-    ax.scatter([rx], [ry], color="#f72585", s=120, zorder=5, edgecolors='black', linewidths=1.2, label="Robot")
-    ax.arrow(rx, ry, math.cos(ss.robot['theta'])*0.35, math.sin(ss.robot['theta'])*0.35, 
-             head_width=0.18, head_length=0.2, fc='#f72585', ec='black', zorder=6)
+    # Plot Robot Position
+    ax.scatter([ss.x], [ss.y], color="#f72585", s=130, zorder=4, edgecolors='black', linewidths=1.2, label="Robot")
+    ax.arrow(ss.x, ss.y, math.cos(ss.theta)*0.3, math.sin(ss.theta)*0.3, 
+             head_width=0.15, head_length=0.18, fc='#f72585', ec='black', zorder=5)
 
     ax.legend(loc='upper right', framealpha=0.9, fontsize=8)
-    ax.set_title("5-Corner Polygon Room & Clockwise Wall-Following Trace", fontsize=11, fontweight='bold', pad=10)
+    ax.set_title("Data-Driven Robot Trajectory & Wall Reconstruction (~6 Laps)", fontsize=11, fontweight='bold', pad=10)
     
     plot_ph.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
-render_room()
+render_plot()
 
-if st.session_state.running and not st.session_state.reached_exit:
+if st.session_state.running and not st.session_state.reached_end:
     for _ in range(15):
-        if not st.session_state.running or st.session_state.reached_exit:
+        if not st.session_state.running or st.session_state.reached_end:
             break
         do_step()
-        render_room()
+        render_plot()
         time.sleep(speed)
     st.rerun()
