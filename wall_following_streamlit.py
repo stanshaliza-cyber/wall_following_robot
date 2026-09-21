@@ -1,31 +1,40 @@
 """
-Wall-Following Robot — Spatial MDP Simulation (Streamlit)
-==========================================================
+Logistics Warehouse Robot — Spatial MDP Simulation (Streamlit)
+==============================================================
 Run with:
-    pip install streamlit numpy matplotlib
+    pip install streamlit numpy matplotlib pandas
     streamlit run wall_following_streamlit.py
-
-The robot ray-casts a left sensor and a front sensor against real walls.
-The MDP policy (trained in wall_following_mdp.py) steers from the left
-sensor reading; a front-proximity check only overrides at corners, so you
-can watch the policy hug the wall for a full lap without a collision.
 """
 
 import time
 import math
-import random
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Wall-Following Robot — MDP Simulation", layout="wide")
+st.set_page_config(page_title="Logistics Warehouse MDP - Robot Navigation", layout="wide")
 
 # ---------------------------------------------------------------------
-# MDP definition (from wall_following_mdp.py)
+# 1. Load Optimization Results & MDP Definition
 # ---------------------------------------------------------------------
+@st.cache_data
+def load_mdp_data():
+    try:
+        opt_df = pd.read_csv('optimal_value_function.csv')
+        policy = dict(zip(opt_df['State'], opt_df['Optimal_Action']))
+        values = dict(zip(opt_df['State'], opt_df['Optimal_Value']))
+    except Exception:
+        policy = {'Too-Close': 'Sharp-Right-Turn', 'Ideal': 'Move-Forward', 'Too-Far': 'Slight-Left-Turn'}
+        values = {'Too-Close': 100.0, 'Ideal': 100.0, 'Too-Far': 100.0}
+    return policy, values
+
+POLICY, VALUES = load_mdp_data()
+
 STATES = ['Too-Close', 'Ideal', 'Too-Far']
 COLORS = {'Too-Close': '#f2745a', 'Ideal': '#4fd18b', 'Too-Far': '#5b9df2'}
 
+# Empirical transition probabilities estimated from sensor_readings_4.csv
 T = {
     'Too-Close': {'Move-Forward': [0.622, 0.333, 0.044], 'Slight-Right-Turn': [0.955, 0.042, 0.002],
                   'Sharp-Right-Turn': [0.968, 0.027, 0.005], 'Slight-Left-Turn': [0.333, 0.333, 0.333]},
@@ -34,76 +43,67 @@ T = {
     'Too-Far':   {'Move-Forward': [0.0, 0.5, 0.5], 'Slight-Right-Turn': [0.333, 0.333, 0.333],
                   'Sharp-Right-Turn': [0.034, 0.188, 0.778], 'Slight-Left-Turn': [0.003, 0.055, 0.942]},
 }
+
 R = {
     'Too-Close': {'Move-Forward': -10, 'Slight-Right-Turn': 5, 'Sharp-Right-Turn': 10, 'Slight-Left-Turn': -10},
     'Ideal':     {'Move-Forward': 10, 'Slight-Right-Turn': 2, 'Sharp-Right-Turn': -5, 'Slight-Left-Turn': 2},
     'Too-Far':   {'Move-Forward': -2, 'Slight-Right-Turn': -10, 'Sharp-Right-Turn': -10, 'Slight-Left-Turn': 10},
 }
-POLICY = {'Too-Close': 'Sharp-Right-Turn', 'Ideal': 'Move-Forward', 'Too-Far': 'Slight-Left-Turn'}
 
-# turn deltas are in a standard (CCW-positive, y-up) math frame:
-# negative = turn right (clockwise), positive = turn left (counter-clockwise)
 MOVES = {
-    'Move-Forward':      {'turn': 0.0,   'step': 5.5},
-    'Slight-Right-Turn': {'turn': -0.09, 'step': 4.5},
-    'Sharp-Right-Turn':  {'turn': -0.30, 'step': 3.0},
-    'Slight-Left-Turn':  {'turn': 0.09,  'step': 4.5},
+    'Move-Forward':      {'turn': 0.0,   'step': 0.35},
+    'Slight-Right-Turn': {'turn': -0.07, 'step': 0.30},
+    'Sharp-Right-Turn':  {'turn': -0.22, 'step': 0.22},
+    'Slight-Left-Turn':  {'turn': 0.07,  'step': 0.30},
 }
 
 # ---------------------------------------------------------------------
-# Maze geometry (generated maze instead of a single open room)
+# 2. Warehouse Floor Plan & Walls Geometry
 # ---------------------------------------------------------------------
-COLS, ROWS, CELL, M = 9, 6, 1.3, 0.6
-W = COLS * CELL + 2 * M
-H = ROWS * CELL + 2 * M
-SENSOR_RANGE = 8.0
-TOO_CLOSE, TOO_FAR = 0.32, 0.85
-FRONT_SAFETY = 0.45
+WIDTH, HEIGHT = 12.0, 8.0
+ENTRANCE = (1.0, 1.0)
+EXIT = (11.0, 7.0)
 
+def get_warehouse_walls():
+    """Fixed warehouse polygon perimeter and internal storage aisles."""
+    walls = [
+        # Outer Boundary
+        ((0.0, 0.0), (WIDTH, 0.0)),
+        ((WIDTH, 0.0), (WIDTH, HEIGHT)),
+        ((WIDTH, HEIGHT), (0.0, HEIGHT)),
+        ((0.0, HEIGHT), (0.0, 0.0)),
+        # Internal Storage Racks / Partitions (with calculated gap for doorway/opening)
+        ((3.0, 0.0), (3.0, 3.2)),   # Door opening represented by gap from 3.2 to 4.5
+        ((3.0, 4.5), (3.0, 8.0)),
+        ((6.0, 2.0), (6.0, 8.0)),
+        ((9.0, 0.0), (9.0, 6.0)),
+    ]
+    return walls
 
-def generate_maze(seed):
-    """Randomized DFS (recursive backtracker) maze on a COLS x ROWS grid."""
-    rng = random.Random(seed)
-    cells = [[{'N': True, 'S': True, 'E': True, 'W': True} for _ in range(COLS)] for _ in range(ROWS)]
-    visited = [[False] * COLS for _ in range(ROWS)]
-    dirs = [('N', 1, 0, 'S'), ('S', -1, 0, 'N'), ('E', 0, 1, 'W'), ('W', 0, -1, 'E')]
-    stack = [(0, 0)]
-    visited[0][0] = True
-    while stack:
-        r, c = stack[-1]
-        options = []
-        for d, dr, dc, opp in dirs:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < ROWS and 0 <= nc < COLS and not visited[nr][nc]:
-                options.append((d, nr, nc, opp))
-        if options:
-            d, nr, nc, opp = rng.choice(options)
-            cells[r][c][d] = False
-            cells[nr][nc][opp] = False
-            visited[nr][nc] = True
-            stack.append((nr, nc))
-        else:
-            stack.pop()
+# ---------------------------------------------------------------------
+# 3. Sidebar Controls (Shared Threshold Parameters)
+# ---------------------------------------------------------------------
+st.sidebar.header("Shared Model Parameters")
+too_close_thresh = st.sidebar.slider("Too-Close Threshold (m)", 0.3, 0.7, 0.53, 0.01,
+                                     help="Aligned closer to data distribution 33rd percentile (~0.53m)")
+too_far_thresh = st.sidebar.slider("Too-Far Threshold (m)", 0.7, 1.2, 0.71, 0.01,
+                                   help="Aligned closer to data distribution 66th percentile (~0.71m)")
+front_safety = st.sidebar.slider("Front Collision Safety (m)", 0.3, 0.8, 0.45, 0.05)
+sensor_range = 6.0
 
-    segs = []
-    for r in range(ROWS):
-        for c in range(COLS):
-            x0, y0 = M + c * CELL, M + r * CELL
-            x1, y1 = x0 + CELL, y0 + CELL
-            cw = cells[r][c]
-            if cw['S']:
-                segs.append(((x0, y0), (x1, y0)))
-            if cw['W']:
-                segs.append(((x0, y0), (x0, y1)))
-            if c == COLS - 1 and cw['E']:
-                segs.append(((x1, y0), (x1, y1)))
-            if r == ROWS - 1 and cw['N']:
-                segs.append(((x0, y1), (x1, y1)))
-    return segs
+def classify_state(sd_left):
+    if sd_left < too_close_thresh:
+        return 'Too-Close'
+    elif sd_left > too_far_thresh:
+        return 'Too-Far'
+    else:
+        return 'Ideal'
 
-
+# ---------------------------------------------------------------------
+# 4. Ray Casting & Collision Detection
+# ---------------------------------------------------------------------
 def ray_hit(walls, ox, oy, dx, dy):
-    best = SENSOR_RANGE
+    best = sensor_range
     for (ax, ay), (bx, by) in walls:
         sx, sy = bx - ax, by - ay
         denom = dx * sy - dy * sx
@@ -116,219 +116,197 @@ def ray_hit(walls, ox, oy, dx, dy):
             best = t
     return best
 
-
-def sensors(walls, x, y, theta):
+def get_sensors(walls, x, y, theta):
     dx, dy = math.cos(theta), math.sin(theta)
-    ldx, ldy = -math.sin(theta), math.cos(theta)   # left = +90 deg (CCW) from heading
+    ldx, ldy = -math.sin(theta), math.cos(theta) # Left sensor (+90 deg CCW)
     front = ray_hit(walls, x, y, dx, dy)
     left = ray_hit(walls, x, y, ldx, ldy)
     return front, left, (dx, dy), (ldx, ldy)
 
-
-def classify(d):
-    if d < TOO_CLOSE:
-        return 'Too-Close'
-    if d > TOO_FAR:
-        return 'Too-Far'
-    return 'Ideal'
-
-
-def sample_next(probs):
-    r, acc = np.random.random(), 0.0
-    for i, p in enumerate(probs):
-        acc += p
-        if r <= acc:
-            return STATES[i]
-    return STATES[-1]
-
+def check_collision(walls, x, y, radius=0.2):
+    for (ax, ay), (bx, by) in walls:
+        px, py = bx - ax, by - ay
+        length_sq = px**2 + py**2
+        if length_sq == 0:
+            dist = math.hypot(x - ax, y - ay)
+        else:
+            t = max(0, min(1, ((x - ax) * px + (y - ay) * py) / length_sq))
+            proj_x, proj_y = ax + t * px, ay + t * py
+            dist = math.hypot(x - proj_x, y - proj_y)
+        if dist < radius:
+            return True
+    return False
 
 # ---------------------------------------------------------------------
-# Session state
+# 5. Session State Initialization
 # ---------------------------------------------------------------------
-def init_state(new_maze=True, seed=None):
-    if new_maze or 'maze_seed' not in st.session_state:
-        st.session_state.maze_seed = seed if seed is not None else random.randint(0, 1_000_000)
-        st.session_state.walls = generate_maze(st.session_state.maze_seed)
-    st.session_state.robot = {'x': M + CELL / 2, 'y': M + CELL / 2, 'theta': 0.0}
+def init_simulation():
+    st.session_state.walls = get_warehouse_walls()
+    st.session_state.robot = {'x': ENTRANCE[0], 'y': ENTRANCE[1], 'theta': math.pi / 2}
     st.session_state.state = 'Ideal'
     st.session_state.step = 0
     st.session_state.cum_reward = 0
     st.session_state.safety_count = 0
-    st.session_state.trail = []
+    st.session_state.trail = [{'x': ENTRANCE[0], 'y': ENTRANCE[1]}]
     st.session_state.log = []
     st.session_state.running = False
+    st.session_state.reached_exit = False
     st.session_state.last_action = '—'
     st.session_state.last_reward = None
     st.session_state.last_sensors = (None, None)
 
-
 if 'robot' not in st.session_state:
-    init_state(new_maze=True, seed=42)
-
+    init_simulation()
 
 def do_step():
     ss = st.session_state
-    front, left, _, _ = sensors(ss.walls, ss.robot['x'], ss.robot['y'], ss.robot['theta'])
-    ss.state = classify(left)
+    if ss.reached_exit:
+        return
 
-    action = POLICY[ss.state]
+    front, left, _, _ = get_sensors(ss.walls, ss.robot['x'], ss.robot['y'], ss.robot['theta'])
+    ss.state = classify_state(left)
+
+    action = POLICY.get(ss.state, 'Move-Forward')
     overridden = False
-    if front < FRONT_SAFETY:
+    if front < front_safety:
         action = 'Sharp-Right-Turn'
         overridden = True
         ss.safety_count += 1
 
-    reward = R[ss.state][POLICY[ss.state]]
+    reward = R[ss.state][action]
     ss.cum_reward += reward
     ss.step += 1
 
     mv = MOVES[action]
-    ss.robot['theta'] += mv['turn']
-    ss.robot['x'] += math.cos(ss.robot['theta']) * mv['step'] * 0.02
-    ss.robot['y'] += math.sin(ss.robot['theta']) * mv['step'] * 0.02
-    ss.robot['x'] = min(max(ss.robot['x'], M + 0.05), W - M - 0.05)
-    ss.robot['y'] = min(max(ss.robot['y'], M + 0.05), H - M - 0.05)
+    new_theta = ss.robot['theta'] + mv['turn']
+    new_x = ss.robot['x'] + math.cos(new_theta) * mv['step']
+    new_y = ss.robot['y'] + math.sin(new_theta) * mv['step']
+
+    if not check_collision(ss.walls, new_x, new_y, radius=0.22):
+        ss.robot['x'] = new_x
+        ss.robot['y'] = new_y
+        ss.robot['theta'] = new_theta
+    else:
+        ss.robot['theta'] -= 0.45  # Collision avoidance turn correction
 
     ss.trail.append({'x': ss.robot['x'], 'y': ss.robot['y']})
-    if len(ss.trail) > 3000:
-        ss.trail.pop(0)
+
+    if math.hypot(ss.robot['x'] - EXIT[0], ss.robot['y'] - EXIT[1]) < 0.75:
+        ss.reached_exit = True
+        ss.log.append(f"🎉 Robot successfully reached the Warehouse Exit!")
 
     ss.last_action = action + (' (safety)' if overridden else '')
     ss.last_reward = reward
     ss.last_sensors = (left, front)
 
     tag = "SAFETY" if overridden else ss.state
-    ss.log.append(f"#{ss.step:04d}  {tag:<10s}  {action:<18s}  reward {reward:+d}")
-    if len(ss.log) > 200:
+    ss.log.append(f"#{ss.step:03d} | State: {tag:<10s} | Action: {action:<18s} | Reward: {reward:+d}")
+    if len(ss.log) > 100:
         ss.log.pop(0)
 
-    ss.state = sample_next(T[ss.state][POLICY[ss.state]])
-
-
-def reset(new_maze=False):
-    init_state(new_maze=new_maze)
-
-
 # ---------------------------------------------------------------------
-# Layout
+# 6. Main UI Layout
 # ---------------------------------------------------------------------
-st.title("Wall-Following Robot — MDP Maze Trace")
-st.caption("A maze defines the boundaries; the trained policy steers from the left-sensor "
-           "reading, with a front-proximity check that only intervenes to avoid a collision. "
-           "The red trace is the path actually taken.")
+st.title("📦 Logistics Warehouse MDP — Robot Navigation")
+st.caption("Refactored floor plan featuring unified threshold parameters, wall collision checking, and path tracing from Entrance to Exit.")
 
-col_plot, col_side = st.columns([2.2, 1])
+col_plot, col_side = st.columns([2.2, 1.0])
 
 with col_plot:
-    b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 2])
-    if b1.button("▶ Play" if not st.session_state.running else "⏸ Pause"):
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 2])
+    if b1.button("▶ Play / Pause"):
         st.session_state.running = not st.session_state.running
     if b2.button("Step"):
         do_step()
-    if b3.button("Reset"):
-        reset(new_maze=False)
-    if b4.button("New Maze"):
-        reset(new_maze=True)
-    speed = b5.slider("Speed (sec/step)", 0.02, 0.5, 0.06, 0.02)
+    if b3.button("Reset Robot"):
+        init_simulation()
+    speed = b4.slider("Simulation Speed (s/step)", 0.02, 0.3, 0.06, 0.02)
     plot_ph = st.empty()
 
 with col_side:
-    st.subheader("Current state")
+    st.subheader("Navigation Status")
     m1, m2 = st.columns(2)
     m1.metric("Step", st.session_state.step)
-    m2.metric("Cumulative reward", st.session_state.cum_reward)
-    state_ph = st.empty()
-    sens_ph = st.empty()
-    action_ph = st.empty()
-    reward_ph = st.empty()
-    safety_ph = st.empty()
+    m2.metric("Total Reward", st.session_state.cum_reward)
+    
+    if st.session_state.reached_exit:
+        st.success("Target Exit Reached!")
 
-    st.subheader("P(next state | current, action)")
-    bars_ph = st.empty()
+    st.write(f"**Current State:** `{st.session_state.state}`")
+    if st.session_state.last_sensors[0] is not None:
+        st.write(f"Left / Front Sensor: `{st.session_state.last_sensors[0]:.2f}m` / `{st.session_state.last_sensors[1]:.2f}m`")
+    st.write(f"Selected Action: `{st.session_state.last_action}`")
+    st.write(f"Safety Overrides: `{st.session_state.safety_count}`")
 
-    st.subheader("Event log")
-    log_ph = st.empty()
+    st.subheader("Optimal Values & Policy")
+    val_disp = pd.DataFrame({
+        'State': list(POLICY.keys()),
+        'Optimal Action': list(POLICY.values()),
+        'Value V(s)': [f"{VALUES.get(s, 100):.1f}" for s in POLICY.keys()]
+    })
+    st.dataframe(val_disp, hide_index=True)
 
+    st.subheader("Event Log")
+    st.code("\n".join(st.session_state.log[-12:]) if st.session_state.log else "—", language=None)
 
-def draw_dotted_border(ax, x0, y0, x1, y1, spacing=0.22, size=28):
-    """Small alternating black/orange squares tracing the outer frame,
-    matching the classic maze-print border look."""
-    pts = []
-    n = int((x1 - x0) / spacing)
-    for i in range(n + 1):
-        pts.append((x0 + i * spacing, y0))
-        pts.append((x0 + i * spacing, y1))
-    n = int((y1 - y0) / spacing)
-    for i in range(n + 1):
-        pts.append((x0, y0 + i * spacing))
-        pts.append((x1, y0 + i * spacing))
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    cols = ['#111111' if i % 2 == 0 else '#f2a33a' for i in range(len(pts))]
-    ax.scatter(xs, ys, c=cols, s=size, marker='s', zorder=1, edgecolors='none')
-
-
-def render():
+# ---------------------------------------------------------------------
+# 7. Render Visualization
+# ---------------------------------------------------------------------
+def render_warehouse():
     ss = st.session_state
-    fig, ax = plt.subplots(figsize=(7, 4.7))
-    fig.patch.set_facecolor('white')
-    ax.set_facecolor('white')
-    ax.set_xlim(-0.15, W + 0.15)
-    ax.set_ylim(-0.15, H + 0.15)
+    fig, ax = plt.subplots(figsize=(7, 4.8))
+    fig.patch.set_facecolor('#f8f9fa')
+    ax.set_facecolor('#ffffff')
+    ax.set_xlim(-0.5, WIDTH + 0.5)
+    ax.set_ylim(-0.5, HEIGHT + 0.5)
     ax.set_aspect('equal')
-    ax.axis('off')
 
-    draw_dotted_border(ax, 0, 0, W, H)
+    ax.set_xticks(range(0, int(WIDTH) + 1, 2))
+    ax.set_yticks(range(0, int(HEIGHT) + 1, 2))
+    ax.grid(True, linestyle=':', alpha=0.5, color='#cccccc')
 
-    # maze walls
+    # Draw walls
     for (ax0, ay0), (bx0, by0) in ss.walls:
-        ax.plot([ax0, bx0], [ay0, by0], color="#111111", linewidth=6, solid_capstyle='round', zorder=2)
+        ax.plot([ax0, bx0], [ay0, by0], color="#2b2d42", linewidth=5, solid_capstyle='round', zorder=2)
 
-    # sensors (subtle, drawn under the trail)
-    front, left, fdir, ldir = sensors(ss.walls, ss.robot['x'], ss.robot['y'], ss.robot['theta'])
+    # Draw Entrance & Exit markers
+    ax.scatter([ENTRANCE[0]], [ENTRANCE[1]], color="#2a9d8f", s=180, marker='s', zorder=3, label="Entrance")
+    ax.text(ENTRANCE[0], ENTRANCE[1] - 0.4, "Entrance", color="#2a9d8f", fontweight='bold', ha='center', fontsize=9)
+
+    ax.scatter([EXIT[0]], [EXIT[1]], color="#e76f51", s=180, marker='*', zorder=3, label="Exit")
+    ax.text(EXIT[0], EXIT[1] + 0.4, "Exit", color="#e76f51", fontweight='bold', ha='center', fontsize=9)
+
+    # Draw sensor rays
     rx, ry = ss.robot['x'], ss.robot['y']
-    ax.plot([rx, rx + ldir[0] * left], [ry, ry + ldir[1] * left], color="#c9c9c9", linestyle='--', linewidth=1, zorder=3)
-    ax.plot([rx, rx + fdir[0] * front], [ry, ry + fdir[1] * front], color="#c9c9c9", linestyle='--', linewidth=1, zorder=3)
+    front, left, fdir, ldir = get_sensors(ss.walls, rx, ry, ss.robot['theta'])
+    ax.plot([rx, rx + ldir[0] * left], [ry, ry + ldir[1] * left], color="#adb5bd", linestyle='--', linewidth=1.2, zorder=3)
+    ax.plot([rx, rx + fdir[0] * front], [ry, ry + fdir[1] * front], color="#adb5bd", linestyle='--', linewidth=1.2, zorder=3)
 
-    # red path trace, with beads every few points for the "solved maze" look
+    # Draw Robot Path Trace
     if len(ss.trail) > 1:
         xs = [p['x'] for p in ss.trail]
         ys = [p['y'] for p in ss.trail]
-        ax.plot(xs, ys, color="#e8352b", linewidth=2, zorder=4)
-        ax.scatter(xs[::4], ys[::4], color="#e8352b", s=6, zorder=4)
+        ax.plot(xs, ys, color="#3a86ff", linewidth=2.5, label="Robot Path Trace", zorder=4)
+        ax.scatter(xs[::3], ys[::3], color="#4361ee", s=10, zorder=4)
 
-    # robot as a red dot
-    ax.scatter([rx], [ry], color="#e8352b", s=90, zorder=5, edgecolors='black', linewidths=1)
+    # Draw Robot Position & Heading
+    ax.scatter([rx], [ry], color="#f72585", s=120, zorder=5, edgecolors='black', linewidths=1.2, label="Robot")
+    ax.arrow(rx, ry, math.cos(ss.robot['theta'])*0.4, math.sin(ss.robot['theta'])*0.4, 
+             head_width=0.2, head_length=0.25, fc='#f72585', ec='black', zorder=6)
 
+    ax.legend(loc='upper right', framealpha=0.9, fontsize=8)
+    ax.set_title("Warehouse Floor Plan & Robot Navigation Trace", fontsize=11, fontweight='bold', pad=10)
+    
     plot_ph.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
-    state_ph.markdown(f"**Left sensor state:** :{'red' if ss.state=='Too-Close' else 'green' if ss.state=='Ideal' else 'blue'}[{ss.state}]")
-    if ss.last_sensors[0] is not None:
-        sens_ph.write(f"Left / front dist: `{ss.last_sensors[0]:.2f}` / `{ss.last_sensors[1]:.2f}`")
-    action_ph.write(f"Action: `{ss.last_action}`")
-    if ss.last_reward is not None:
-        reward_ph.write(f"Step reward: `{ss.last_reward:+d}`")
-    safety_ph.write(f"Safety overrides: `{ss.safety_count}`")
+render_warehouse()
 
-    a = POLICY[ss.state]
-    probs = T[ss.state][a]
-    bars_ph.bar_chart({"P(next state)": dict(zip(STATES, probs))})
-
-    log_ph.code("\n".join(ss.log[-15:]) if ss.log else "—", language=None)
-
-
-render()
-
-if st.session_state.running:
-    # Animate a batch of steps inside this one script run so only the plot
-    # image updates each tick (no full-page re-render), then rerun once at
-    # the end of the batch so the Play/Pause/Reset buttons stay responsive.
-    STEPS_PER_BATCH = 15
-    for _ in range(STEPS_PER_BATCH):
-        if not st.session_state.running:
+if st.session_state.running and not st.session_state.reached_exit:
+    for _ in range(12):
+        if not st.session_state.running or st.session_state.reached_exit:
             break
         do_step()
-        render()
+        render_warehouse()
         time.sleep(speed)
     st.rerun()
