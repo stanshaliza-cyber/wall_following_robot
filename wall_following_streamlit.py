@@ -50,41 +50,56 @@ R = {
 }
 
 MOVES = {
-    'Move-Forward':      {'turn': 0.0,   'step': 0.40},
-    'Slight-Right-Turn': {'turn': -0.06, 'step': 0.35},
-    'Sharp-Right-Turn':  {'turn': -0.18, 'step': 0.28},
-    'Slight-Left-Turn':  {'turn': 0.06,  'step': 0.35},
+    'Move-Forward':      {'turn': 0.0,   'step': 0.35},
+    'Slight-Right-Turn': {'turn': -0.07, 'step': 0.30},
+    'Sharp-Right-Turn':  {'turn': -0.20, 'step': 0.24},
+    'Slight-Left-Turn':  {'turn': 0.07,  'step': 0.30},
 }
 
 # ---------------------------------------------------------------------
-# 2. Warehouse Floor Plan & Walls Geometry (Wider Openings)
+# 2. 5-Corner Polygon Room (~3m x 5.5m) Based on Analysis
 # ---------------------------------------------------------------------
-WIDTH, HEIGHT = 12.0, 8.0
-ENTRANCE = (1.0, 1.0)
-EXIT = (11.0, 7.0)
+ENTRANCE = (1.5, 1.2)
+EXIT = (3.5, 5.0)  # Located at the left-wall opening / gap
 
-def get_warehouse_walls():
-    """Warehouse layout with wider aisles and generous doorways to prevent oscillation."""
-    walls = [
-        # Outer Boundary
-        ((0.0, 0.0), (WIDTH, 0.0)),
-        ((WIDTH, 0.0), (WIDTH, HEIGHT)),
-        ((WIDTH, HEIGHT), (0.0, HEIGHT)),
-        ((0.0, HEIGHT), (0.0, 0.0)),
-        # Internal Storage Racks with wide gaps for smooth navigation
-        ((3.5, 0.0), (3.5, 2.5)),   # Aisle gap from 2.5 to 5.5
-        ((3.5, 5.5), (3.5, 8.0)),
-        ((7.0, 2.5), (7.0, 8.0)),   # Aisle gap from 0.0 to 2.5
+def get_polygon_walls():
+    """Defines a closed 5-corner polygon room (approx 3m x 5.5m) with a wall opening."""
+    # 5 vertices forming the perimeter
+    pts = [
+        (1.0, 1.0),   # Corner 1 (Bottom-Left)
+        (4.0, 1.0),   # Corner 2 (Bottom-Right)
+        (5.2, 3.5),   # Corner 3 (Mid-Right)
+        (4.2, 5.8),   # Corner 4 (Top-Right)
+        (1.2, 5.0)    # Corner 5 (Top-Left)
     ]
+    
+    walls = []
+    n = len(pts)
+    for i in range(n):
+        p1 = pts[i]
+        p2 = pts[(i + 1) % n]
+        
+        # Introduce a wall gap / opening on the left wall segment (e.g., segment between Corner 5 and Corner 1)
+        if i == n - 1:
+            # Split wall to create a doorway/opening
+            mid_p = (p1[0] * 0.5 + p2[0] * 0.5, p1[1] * 0.5 + p2[1] * 0.5)
+            # Add wall before opening and wall after opening
+            walls.append((p1, (mid_p[0] - 0.3, mid_p[1] - 0.3)))
+            walls.append(((mid_p[0] + 0.3, mid_p[1] + 0.3), p2))
+        else:
+            walls.append((p1, p2))
+            
     return walls
 
 # ---------------------------------------------------------------------
 # 3. Sidebar Controls (Shared Threshold Parameters)
 # ---------------------------------------------------------------------
 st.sidebar.header("Shared Model Parameters")
-too_close_thresh = st.sidebar.slider("Too-Close Threshold (m)", 0.3, 0.7, 0.53, 0.01)
-too_far_thresh = st.sidebar.slider("Too-Far Threshold (m)", 0.7, 1.3, 0.75, 0.01)
-front_safety = st.sidebar.slider("Front Collision Safety (m)", 0.3, 0.8, 0.40, 0.05)
+too_close_thresh = st.sidebar.slider("Too-Close Threshold (m)", 0.3, 0.7, 0.53, 0.01,
+                                     help="Aligned with data 33rd percentile (~0.53m)")
+too_far_thresh = st.sidebar.slider("Too-Far Threshold (m)", 0.7, 1.2, 0.71, 0.01,
+                                   help="Aligned with data 66th percentile (~0.71m)")
+front_safety = st.sidebar.slider("Front Collision Safety (m)", 0.2, 0.6, 0.38, 0.05)
 sensor_range = 6.0
 
 def classify_state(sd_left):
@@ -119,7 +134,7 @@ def get_sensors(walls, x, y, theta):
     left = ray_hit(walls, x, y, ldx, ldy)
     return front, left, (dx, dy), (ldx, ldy)
 
-def check_collision(walls, x, y, radius=0.2):
+def check_collision(walls, x, y, radius=0.18):
     for (ax, ay), (bx, by) in walls:
         px, py = bx - ax, by - ay
         length_sq = px**2 + py**2
@@ -137,8 +152,8 @@ def check_collision(walls, x, y, radius=0.2):
 # 5. Session State Initialization
 # ---------------------------------------------------------------------
 def init_simulation():
-    st.session_state.walls = get_warehouse_walls()
-    st.session_state.robot = {'x': ENTRANCE[0], 'y': ENTRANCE[1], 'theta': math.pi / 2}
+    st.session_state.walls = get_polygon_walls()
+    st.session_state.robot = {'x': ENTRANCE[0], 'y': ENTRANCE[1], 'theta': 0.0}
     st.session_state.state = 'Ideal'
     st.session_state.step = 0
     st.session_state.cum_reward = 0
@@ -164,8 +179,6 @@ def do_step():
 
     action = POLICY.get(ss.state, 'Move-Forward')
     overridden = False
-    
-    # Anti-oscillation & front collision safeguard
     if front < front_safety:
         action = 'Sharp-Right-Turn'
         overridden = True
@@ -180,24 +193,18 @@ def do_step():
     new_x = ss.robot['x'] + math.cos(new_theta) * mv['step']
     new_y = ss.robot['y'] + math.sin(new_theta) * mv['step']
 
-    # Anti-oscillation escape mechanism: if robot trail is bunching up, nudge forward
-    if len(ss.trail) > 5:
-        recent_dist = math.hypot(new_x - ss.trail[-1]['x'], new_y - ss.trail[-1]['y'])
-        if recent_dist < 0.05:
-            new_theta += 0.3  # slight nudge to break oscillation loop
-
-    if not check_collision(ss.walls, new_x, new_y, radius=0.2):
+    if not check_collision(ss.walls, new_x, new_y, radius=0.18):
         ss.robot['x'] = new_x
         ss.robot['y'] = new_y
         ss.robot['theta'] = new_theta
     else:
-        ss.robot['theta'] -= 0.5  # turn away from obstacle
+        ss.robot['theta'] -= 0.5  # smooth turn away from wall
 
     ss.trail.append({'x': ss.robot['x'], 'y': ss.robot['y']})
 
-    if math.hypot(ss.robot['x'] - EXIT[0], ss.robot['y'] - EXIT[1]) < 0.8:
+    if math.hypot(ss.robot['x'] - EXIT[0], ss.robot['y'] - EXIT[1]) < 0.6:
         ss.reached_exit = True
-        ss.log.append(f"🎉 Robot successfully reached the Warehouse Exit!")
+        ss.log.append(f"🎉 Robot successfully reached the Exit opening!")
 
     ss.last_action = action + (' (safety)' if overridden else '')
     ss.last_reward = reward
@@ -211,8 +218,8 @@ def do_step():
 # ---------------------------------------------------------------------
 # 6. Main UI Layout
 # ---------------------------------------------------------------------
-st.title("📦 Logistics Warehouse MDP — Robot Navigation")
-st.caption("Optimized warehouse floor plan with wide aisles and anti-oscillation routing from Entrance to Exit.")
+st.title("🤖 5-Corner Polygon Room — Robot Navigation MDP")
+st.caption("Refactored based on empirical data analysis: single closed loop (~3m × 5.5m) with 5 corners, clockwise wall-following, and a left-wall opening.")
 
 col_plot, col_side = st.columns([2.2, 1.0])
 
@@ -224,7 +231,7 @@ with col_plot:
         do_step()
     if b3.button("Reset Robot"):
         init_simulation()
-    speed = b4.slider("Simulation Speed (s/step)", 0.02, 0.3, 0.06, 0.02)
+    speed = b4.slider("Simulation Speed (s/step)", 0.02, 0.3, 0.05, 0.02)
     plot_ph = st.empty()
 
 with col_side:
@@ -248,29 +255,27 @@ with col_side:
 # ---------------------------------------------------------------------
 # 7. Render Visualization
 # ---------------------------------------------------------------------
-def render_warehouse():
+def render_room():
     ss = st.session_state
-    fig, ax = plt.subplots(figsize=(7, 4.8))
+    fig, ax = plt.subplots(figsize=(7, 5.0))
     fig.patch.set_facecolor('#f8f9fa')
     ax.set_facecolor('#ffffff')
-    ax.set_xlim(-0.5, WIDTH + 0.5)
-    ax.set_ylim(-0.5, HEIGHT + 0.5)
+    ax.set_xlim(0.0, 6.0)
+    ax.set_ylim(0.0, 6.5)
     ax.set_aspect('equal')
 
-    ax.set_xticks(range(0, int(WIDTH) + 1, 2))
-    ax.set_yticks(range(0, int(HEIGHT) + 1, 2))
     ax.grid(True, linestyle=':', alpha=0.5, color='#cccccc')
 
-    # Draw walls
+    # Draw polygon walls
     for (ax0, ay0), (bx0, by0) in ss.walls:
         ax.plot([ax0, bx0], [ay0, by0], color="#2b2d42", linewidth=5, solid_capstyle='round', zorder=2)
 
     # Draw Entrance & Exit markers
-    ax.scatter([ENTRANCE[0]], [ENTRANCE[1]], color="#2a9d8f", s=180, marker='s', zorder=3, label="Entrance")
-    ax.text(ENTRANCE[0], ENTRANCE[1] - 0.4, "Entrance", color="#2a9d8f", fontweight='bold', ha='center', fontsize=9)
+    ax.scatter([ENTRANCE[0]], [ENTRANCE[1]], color="#2a9d8f", s=160, marker='s', zorder=3, label="Entrance")
+    ax.text(ENTRANCE[0], ENTRANCE[1] - 0.35, "Entrance", color="#2a9d8f", fontweight='bold', ha='center', fontsize=9)
 
-    ax.scatter([EXIT[0]], [EXIT[1]], color="#e76f51", s=180, marker='*', zorder=3, label="Exit")
-    ax.text(EXIT[0], EXIT[1] + 0.4, "Exit", color="#e76f51", fontweight='bold', ha='center', fontsize=9)
+    ax.scatter([EXIT[0]], [EXIT[1]], color="#e76f51", s=160, marker='*', zorder=3, label="Exit (Opening)")
+    ax.text(EXIT[0], EXIT[1] + 0.35, "Exit", color="#e76f51", fontweight='bold', ha='center', fontsize=9)
 
     # Draw sensor rays
     rx, ry = ss.robot['x'], ss.robot['y']
@@ -282,27 +287,26 @@ def render_warehouse():
     if len(ss.trail) > 1:
         xs = [p['x'] for p in ss.trail]
         ys = [p['y'] for p in ss.trail]
-        ax.plot(xs, ys, color="#3a86ff", linewidth=2.5, label="Robot Path Trace", zorder=4)
-        ax.scatter(xs[::3], ys[::3], color="#4361ee", s=10, zorder=4)
+        ax.plot(xs, ys, color="#3a86ff", linewidth=2.5, label="Robot Path Loop", zorder=4)
 
     # Draw Robot Position & Heading
     ax.scatter([rx], [ry], color="#f72585", s=120, zorder=5, edgecolors='black', linewidths=1.2, label="Robot")
-    ax.arrow(rx, ry, math.cos(ss.robot['theta'])*0.4, math.sin(ss.robot['theta'])*0.4, 
-             head_width=0.2, head_length=0.25, fc='#f72585', ec='black', zorder=6)
+    ax.arrow(rx, ry, math.cos(ss.robot['theta'])*0.35, math.sin(ss.robot['theta'])*0.35, 
+             head_width=0.18, head_length=0.2, fc='#f72585', ec='black', zorder=6)
 
     ax.legend(loc='upper right', framealpha=0.9, fontsize=8)
-    ax.set_title("Warehouse Floor Plan & Robot Navigation Trace", fontsize=11, fontweight='bold', pad=10)
+    ax.set_title("5-Corner Polygon Room & Clockwise Wall-Following Trace", fontsize=11, fontweight='bold', pad=10)
     
     plot_ph.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
-render_warehouse()
+render_room()
 
 if st.session_state.running and not st.session_state.reached_exit:
-    for _ in range(12):
+    for _ in range(15):
         if not st.session_state.running or st.session_state.reached_exit:
             break
         do_step()
-        render_warehouse()
+        render_room()
         time.sleep(speed)
     st.rerun()
